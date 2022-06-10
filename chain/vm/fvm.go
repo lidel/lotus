@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -18,6 +20,7 @@ import (
 	cbor "github.com/ipfs/go-ipld-cbor"
 	car "github.com/ipld/go-car"
 	mh "github.com/multiformats/go-multihash"
+	cbg "github.com/whyrusleeping/cbor-gen"
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/exitcode"
@@ -383,6 +386,27 @@ func NewDebugFVM(ctx context.Context, opts *VMOpts) (*FVM, error) {
 		return mfData, nil
 	}
 
+	putMapping := func(ar map[cid.Cid]cid.Cid) (cid.Cid, error) {
+		var mapping xMapping
+
+		mapping.redirects = make([]xRedirect, 0, len(ar))
+		for from, to := range ar {
+			mapping.redirects = append(mapping.redirects, xRedirect{from: from, to: to})
+		}
+		sort.Slice(mapping.redirects, func(i, j int) bool {
+			return bytes.Compare(mapping.redirects[i].from.Bytes(), mapping.redirects[j].from.Bytes()) < 0
+		})
+
+		// Passing this as a pointer of structs has proven to be an enormous PiTA; hence this code.
+		cborStore := cbor.NewCborStore(overlayBstore)
+		mappingCid, err := cborStore.Put(context.TODO(), &mapping)
+		if err != nil {
+			return cid.Undef, err
+		}
+
+		return mappingCid, nil
+	}
+
 	switch opts.NetworkVersion {
 	case network.Version15:
 		if bundle := os.Getenv("LOTUS_FVM_DEBUG_BUNDLE_V7"); bundle != "" {
@@ -409,7 +433,11 @@ func NewDebugFVM(ctx context.Context, opts *VMOpts) (*FVM, error) {
 			}
 
 			if len(actorRedirect) > 0 {
-				fvmopts.ActorRedirect = actorRedirect
+				mappingCid, err := putMapping(actorRedirect)
+				if err != nil {
+					return nil, xerrors.Errorf("error writing redirect mapping: %w", err)
+				}
+				fvmopts.ActorRedirect = mappingCid
 			}
 		}
 
@@ -438,7 +466,11 @@ func NewDebugFVM(ctx context.Context, opts *VMOpts) (*FVM, error) {
 			}
 
 			if len(actorRedirect) > 0 {
-				fvmopts.ActorRedirect = actorRedirect
+				mappingCid, err := putMapping(actorRedirect)
+				if err != nil {
+					return nil, xerrors.Errorf("error writing redirect mapping: %w", err)
+				}
+				fvmopts.ActorRedirect = mappingCid
 			}
 		}
 	}
@@ -576,4 +608,41 @@ func (vm *FVM) ApplyImplicitMessage(ctx context.Context, cmsg *types.Message) (*
 
 func (vm *FVM) Flush(ctx context.Context) (cid.Cid, error) {
 	return vm.fvm.Flush()
+}
+
+// Passing this as a pointer of structs has proven to be an enormous PiTA; hence this code.
+type xRedirect struct{ from, to cid.Cid }
+type xMapping struct{ redirects []xRedirect }
+
+func (m *xMapping) MarshalCBOR(w io.Writer) error {
+	scratch := make([]byte, 9)
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(len(m.redirects))); err != nil {
+		return err
+	}
+
+	for _, v := range m.redirects {
+		if err := v.MarshalCBOR(w); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *xRedirect) MarshalCBOR(w io.Writer) error {
+	scratch := make([]byte, 9)
+
+	if err := cbg.WriteMajorTypeHeaderBuf(scratch, w, cbg.MajArray, uint64(2)); err != nil {
+		return err
+	}
+
+	if err := cbg.WriteCidBuf(scratch, w, r.from); err != nil {
+		return xerrors.Errorf("failed to write cid field from: %w", err)
+	}
+
+	if err := cbg.WriteCidBuf(scratch, w, r.to); err != nil {
+		return xerrors.Errorf("failed to write cid field from: %w", err)
+	}
+
+	return nil
 }
