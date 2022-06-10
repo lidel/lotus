@@ -16,9 +16,13 @@ import (
 	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/state"
 	cbor "github.com/ipfs/go-ipld-cbor"
+	car "github.com/ipld/go-car"
+	mh "github.com/multiformats/go-multihash"
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/exitcode"
+	"github.com/filecoin-project/go-state-types/manifest"
+	"github.com/filecoin-project/go-state-types/network"
 	"github.com/filecoin-project/lotus/lib/sigs"
 
 	"golang.org/x/xerrors"
@@ -295,6 +299,148 @@ func NewFVM(ctx context.Context, opts *VMOpts) (*FVM, error) {
 		}
 
 		fvmopts.Manifest = c
+	}
+
+	fvm, err := ffi.CreateFVM(fvmopts)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &FVM{
+		fvm: fvm,
+	}, nil
+}
+
+func NewDebugFVM(ctx context.Context, opts *VMOpts) (*FVM, error) {
+	state, err := state.LoadStateTree(cbor.NewCborStore(opts.Bstore), opts.StateBase)
+	if err != nil {
+		return nil, err
+	}
+
+	circToReport, err := opts.CircSupplyCalc(ctx, opts.Epoch, state)
+	if err != nil {
+		return nil, err
+	}
+
+	baseBstore := opts.Bstore
+	overlayBstore := blockstore.NewMemorySync()
+	vmBstore := blockstore.NewTieredBstore(overlayBstore, baseBstore)
+
+	fvmopts := &ffi.FVMOpts{
+		FVMVersion: 0,
+		Externs: &FvmExtern{
+			Rand:       opts.Rand,
+			Blockstore: vmBstore,
+			lbState:    opts.LookbackState,
+			base:       opts.StateBase,
+			epoch:      opts.Epoch,
+		},
+		Epoch:          opts.Epoch,
+		BaseFee:        opts.BaseFee,
+		BaseCircSupply: circToReport,
+		NetworkVersion: opts.NetworkVersion,
+		StateBase:      opts.StateBase,
+		Tracing:        EnableDetailedTracing,
+	}
+
+	fvmopts.Debug = true
+
+	// TODO move these two util functions somewhere more general
+	loadBundle := func(bundle string) (cid.Cid, error) {
+		f, err := os.Open(bundle)
+		if err != nil {
+			return cid.Undef, xerrors.Errorf("error opening debug bundle: %w", err)
+		}
+		defer f.Close() //nolint
+
+		hdr, err := car.LoadCar(ctx, overlayBstore, f)
+		if err != nil {
+			return cid.Undef, xerrors.Errorf("error loading debug bundle: %w", err)
+		}
+
+		return hdr.Roots[0], nil
+	}
+
+	loadManifest := func(mfCid cid.Cid) (manifest.ManifestData, error) {
+		adtStore := adt.WrapStore(ctx, cbor.NewCborStore(overlayBstore))
+
+		var mf manifest.Manifest
+		var mfData manifest.ManifestData
+
+		if err := adtStore.Get(ctx, mfCid, &mf); err != nil {
+			return mfData, xerrors.Errorf("error reading debug manifest: %w", err)
+		}
+
+		if err := mf.Load(ctx, adtStore); err != nil {
+			return mfData, xerrors.Errorf("error loading debug manifest: %w", err)
+		}
+
+		if err := adtStore.Get(ctx, mf.Data, &mfData); err != nil {
+			return mfData, xerrors.Errorf("error fetching manifest data: %w", err)
+		}
+
+		return mfData, nil
+	}
+
+	switch opts.NetworkVersion {
+	case network.Version15:
+		if bundle := os.Getenv("LOTUS_FVM_DEBUG_BUNDLE_V7"); bundle != "" {
+			mfCid, err := loadBundle(bundle)
+			if err != nil {
+				return nil, err
+			}
+
+			mf, err := loadManifest(mfCid)
+			if err != nil {
+				return nil, err
+			}
+
+			// create actor redirect mapping from the synthetic Cid to the debug code
+			cb := cid.V1Builder{Codec: cid.Raw, MhType: mh.IDENTITY}
+			actorRedirect := make(map[cid.Cid]cid.Cid)
+			for _, e := range mf.Entries {
+				fromStr := fmt.Sprintf("fil/7/%s", e.Name)
+				from, err := cb.Sum([]byte(fromStr))
+				if err != nil {
+					return nil, xerrors.Errorf("error building synethic CID for debug redirect: %w", err)
+				}
+				actorRedirect[from] = e.Code
+			}
+
+			if len(actorRedirect) > 0 {
+				fvmopts.ActorRedirect = actorRedirect
+			}
+		}
+
+	case network.Version16:
+		if bundle := os.Getenv("LOTUS_FVM_DEBUG_BUNDLE_V8"); bundle != "" {
+			mfCid, err := loadBundle(bundle)
+			if err != nil {
+				return nil, err
+			}
+
+			mf, err := loadManifest(mfCid)
+			if err != nil {
+				return nil, err
+			}
+
+			// create actor redirect mapping
+			actorRedirect := make(map[cid.Cid]cid.Cid)
+			for _, e := range mf.Entries {
+				from, ok := actors.GetActorCodeID(actors.Version8, e.Name)
+				if !ok {
+					log.Warnf("unknown actor %s", e.Name)
+					continue
+				}
+
+				actorRedirect[from] = e.Code
+			}
+
+			if len(actorRedirect) > 0 {
+				fvmopts.ActorRedirect = actorRedirect
+			}
+		}
 	}
 
 	fvm, err := ffi.CreateFVM(fvmopts)
